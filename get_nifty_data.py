@@ -1,151 +1,279 @@
+"""
+upstox_oauth_login.py
+
+Requirements:
+    pip install requests
+
+How it works:
+  1. Start a tiny HTTP server on localhost to receive the redirect with ?code=...
+  2. Open the Upstox authorization URL in the default browser.
+  3. After you log in and approve, Upstox redirects to your redirect_uri with code.
+  4. The script exchanges that code for an access_token.
+  5. It verifies the access_token by calling the /user/profile API.
+  6. It fetches expired expiries for Nifty and sample expired contracts.
+"""
+
+from datetime import datetime, date, timedelta
+import http.server
+import socketserver
+import threading
+import urllib.parse as urlparse
+import webbrowser
 import requests
-import pandas as pd
-import argparse
-from urllib.parse import quote
+import sys
+import time
+from collections import defaultdict
 
-def get_access_token(client_id, client_secret, redirect_uri, code):
-    """
-    Get the access token from the Upstox API.
-    """
-    url = "https://api-v2.upstox.com/login/authorization/token"
-    headers = {
-        'accept': 'application/json',
-        'Content-Type': 'application/x-www-form-urlencoded'
-    }
+# ======= CONFIGURE THESE =======
+CLIENT_ID = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"   # client_id / API Key
+CLIENT_SECRET = "xxxxxxxxxxx"                         # client_secret
+REDIRECT_HOST = "localhost"
+REDIRECT_PORT = 8080
+REDIRECT_URI = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}/"  # must match app settings
+
+# Nifty underlying instrument key (index)
+NIFTY_UNDERLYING = "NSE_INDEX|Nifty 50"
+# ===============================
+
+AUTH_URL = (
+    "https://api.upstox.com/v2/login/authorization/dialog"
+    "?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}"
+)
+TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
+PROFILE_URL = "https://api.upstox.com/v2/user/profile"
+HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle"
+
+EXPIRED_EXPIRIES_URL = "https://api.upstox.com/v2/expired-instruments/expiries"
+EXPIRED_OPTIONS_URL = "https://api.upstox.com/v2/expired-instruments/option/contract"
+
+_received_auth_code = {"code": None, "error": None}
+
+# ---------- Auth flow helpers ----------
+class _Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse.urlparse(self.path)
+        qs = urlparse.parse_qs(parsed.query)
+        if "code" in qs:
+            code = qs["code"][0]
+            _received_auth_code["code"] = code
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h2>Login successful. You can close this window.</h2></body></html>")
+        elif "error" in qs:
+            _received_auth_code["error"] = qs.get("error_description", ["Authorization error"])[0]
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"<html><body><h2>Authorization failed or denied.</h2></body></html>")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return  # suppress logs
+
+def start_local_server(host, port):
+    server = socketserver.TCPServer((host, port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+def build_auth_url(client_id, redirect_uri):
+    return AUTH_URL.format(
+        client_id=urlparse.quote(client_id, safe=""),
+        redirect_uri=urlparse.quote(redirect_uri, safe="")
+    )
+
+def exchange_code_for_token(code, client_id, client_secret, redirect_uri):
+    headers = {"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
     data = {
-        'code': code,
-        'client_id': client_id,
-        'client_secret': client_secret,
-        'redirect_uri': redirect_uri,
-        'grant_type': 'authorization_code'
+        "code": code,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
     }
-    response = requests.post(url, headers=headers, data=data)
-    if response.status_code == 200:
-        return response.json().get('access_token')
+    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+def verify_access_token(access_token):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    resp = requests.get(PROFILE_URL, headers=headers, timeout=15)
+    if resp.status_code == 200:
+        print("✅ Successfully authorized. Profile data:")
+        print(resp.json())
+        return True
     else:
-        print(f"Failed to get access token: {response.text}")
-        return None
+        print("❌ Authorization failed:", resp.status_code, resp.text)
+        return False
 
-def get_expiry_dates(instrument_key, access_token):
-    """
-    Get the expiry dates for a given instrument.
-    """
-    # The API documentation is ambiguous here. The code review suggests the response is a list of dicts.
-    # Let's try to get the full instrument list to be sure.
-    # The documentation for "Get expired future contracts" might give a hint.
-    # It says: "This API retrieves a list of all expired future contracts for a given underlying instrument key."
-    # The response contains "expiry_date" and "instrument_key". This "instrument_key" is likely the expired_instrument_key.
-    # So, let's assume the review is right.
-    # I will use the "Get Expired Future Contracts" endpoint instead of "Get Expiries".
-    # This seems more direct for getting the expired instrument keys.
-    # The endpoint is /expired-instruments/futures/{underlying_key}
+# ---------- New/Modified helpers ----------
+def filter_monthly_expiries(expiry_dates: list[str]) -> list[str]:
+    """From a list of YYYY-MM-DD strings, return only the latest date of each month."""
+    monthly_expiries_by_month = defaultdict(str)
+    for date_str in expiry_dates:
+        # Assuming date_str is 'YYYY-MM-DD'
+        year_month = date_str[:7]
+        if date_str > monthly_expiries_by_month[year_month]:
+            monthly_expiries_by_month[year_month] = date_str
+    return sorted(list(monthly_expiries_by_month.values()), reverse=True)
 
-    encoded_instrument_key = quote(instrument_key)
-    url = f"https://api-v2.upstox.com/expired-instruments/futures/{encoded_instrument_key}"
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Accept': 'application/json'
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        # The response for this endpoint is a list of dicts, each with "instrument_key" and "expiry_date".
-        # The "instrument_key" here is the expired_instrument_key we need.
-        # Let's rename it in our code for clarity.
-        data = response.json().get('data', [])
-        return [{'expiry_date': item['expiry_date'], 'expired_instrument_key': item['instrument_key']} for item in data]
-    else:
-        print(f"Failed to get expiry dates: {response.text}")
-        return None
-
-def get_historical_data(expired_instrument_key, from_date, to_date, access_token):
-    """
-    Get historical OHLC data for an expired instrument.
-    """
+def get_historical_price(access_token, instrument_key, date_str):
+    """Fetch historical candle data for a single day to get the opening price."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    instrument_key_encoded = urlparse.quote(instrument_key)
     interval = "day"
-    # The expired_instrument_key needs to be URL-encoded.
-    encoded_expired_instrument_key = quote(expired_instrument_key)
-    url = f"https://api-v2.upstox.com/expired-instruments/historical/{encoded_expired_instrument_key}/{interval}/{to_date}/{from_date}"
-    headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Accept': 'application/json'
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json().get('data', {}).get('candles', [])
+    url = f"{HISTORICAL_URL}/{instrument_key_encoded}/{interval}/{date_str}/{date_str}"
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    candles = data.get("data", {}).get("candles", [])
+    if candles:
+        # candle format: [timestamp, open, high, low, close, volume, OI]
+        return candles[0][1]  # return the opening price
+    return None
+
+def get_price_at_month_start(access_token, instrument_key, year, month):
+    """Get the opening price of the instrument on the first trading day of the month."""
+    # Try fetching for the first 5 days of the month to find the first trading day
+    for day in range(1, 6):
+        try:
+            date_str = f"{year}-{month:02d}-{day:02d}"
+            price = get_historical_price(access_token, instrument_key, date_str)
+            if price:
+                print(f"Found Nifty opening price for {date_str}: {price}")
+                return price
+        except requests.HTTPError as e:
+            if e.response.status_code == 404:
+                continue # It's a holiday/weekend, try next day
+            else:
+                print(f"HTTP error fetching price for {date_str}: {e}", file=sys.stderr)
+                return None # Or re-raise
+        except Exception as e:
+            print(f"Error fetching price for {date_str}: {e}", file=sys.stderr)
+            return None
+    print(f"Could not find Nifty price for start of {year}-{month:02d}", file=sys.stderr)
+    return None
+
+# ---------- Expired instruments helpers ----------
+def get_expiries(access_token, instrument_key):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {"instrument_key": instrument_key}
+    resp = requests.get(EXPIRED_EXPIRIES_URL, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    print("DEBUG /expired-instruments/expiries response:", data)
+    if isinstance(data, dict) and "data" in data:
+        return data["data"]  # directly the list
+    return []
+
+
+def get_expired_option_contracts(access_token, instrument_key, expiry_date):
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {"instrument_key": instrument_key, "expiry_date": expiry_date}
+    resp = requests.get(EXPIRED_OPTIONS_URL, headers=headers, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    print(f"DEBUG /expired-instruments/option/contract response for {expiry_date}:", data)
+    if isinstance(data, dict):
+        return data.get("data", {}).get("contracts", [])
+    elif isinstance(data, list):
+        return data
     else:
-        print(f"Failed to get historical data for {expired_instrument_key}: {response.text}")
-        return None
+        return []
 
+
+# ---------- Main ----------
 def main():
-    """
-    Main function to run the script.
-    """
-    parser = argparse.ArgumentParser(description="Fetch Nifty expired contract data from Upstox API.")
-    parser.add_argument("--client_id", required=True, help="Upstox API client_id")
-    parser.add_argument("--client_secret", required=True, help="Upstox API client_secret")
-    parser.add_argument("--redirect_uri", required=True, help="Upstox API redirect_uri")
-    parser.add_argument("--code", help="Authorization code from the redirect URL. If not provided, the script will print the auth URL and exit.")
-    parser.add_argument("--expiry_start_date", help="Start date (YYYY-MM-DD) to filter expiries.")
-    parser.add_argument("--expiry_end_date", help="End date (YYYY-MM-DD) to filter expiries.")
-    parser.add_argument("--data_start_date", help="Start date (YYYY-MM-DD) for fetching historical data for each expiry.")
+    if CLIENT_ID.startswith("X") or CLIENT_SECRET.startswith("x"):
+        print("Please edit the script and set CLIENT_ID and CLIENT_SECRET.", file=sys.stderr)
+        sys.exit(1)
 
-    args = parser.parse_args()
+    print("Starting local server to receive redirect (Ctrl+C to quit)...")
+    server, thread = start_local_server(REDIRECT_HOST, REDIRECT_PORT)
 
-    client_id = args.client_id
-    client_secret = args.client_secret
-    redirect_uri = args.redirect_uri
-    code = args.code
+    try:
+        auth_url = build_auth_url(CLIENT_ID, REDIRECT_URI)
+        print("Opening browser for Upstox login. If browser does not open, visit this URL manually:\n")
+        print(auth_url + "\n")
+        webbrowser.open(auth_url)
 
-    if not code:
-        auth_url = f"https://api-v2.upstox.com/login/authorization/dialog?client_id={client_id}&redirect_uri={redirect_uri}&response_type=code"
-        print(f"\nPlease open the following URL in your browser to authorize the application:\n{auth_url}")
-        print("\nAfter authorization, you will be redirected. The URL will look like: <your_redirect_uri>?code=<authorization_code>")
-        print("Please rerun the script with the --code argument, providing the received authorization_code.")
-        return
+        print("Waiting for authorization code... (complete login in the opened browser window)")
+        start = time.time()
+        TIMEOUT = 300  # seconds
+        while time.time() - start < TIMEOUT:
+            if _received_auth_code.get("code"):
+                code = _received_auth_code["code"]
+                print("Received authorization code:", code)
+                break
+            if _received_auth_code.get("error"):
+                raise RuntimeError("Authorization error: " + str(_received_auth_code["error"]))
+            time.sleep(0.5)
+        else:
+            raise TimeoutError("Didn't receive auth code within timeout. Check redirect_uri and browser login.")
 
-    # Get access token
-    access_token = get_access_token(client_id, client_secret, redirect_uri, code)
+        print("Exchanging code for tokens...")
+        token_resp = exchange_code_for_token(code, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
+        print("Token response (JSON):\n", token_resp)
 
-    if not access_token:
-        print("Failed to get access token. Exiting.")
-        return
+        access_token = token_resp.get("access_token")
+        if access_token and verify_access_token(access_token):
+            # Step 1: Fetch all expired expiries for Nifty
+            print("\n📌 Fetching all expired expiries for Nifty...")
+            all_expiries = get_expiries(access_token, NIFTY_UNDERLYING)
 
-    # Get expiry dates
-    nifty_instrument_key = "NSE_INDEX|Nifty 50"
-    expiry_data = get_expiry_dates(nifty_instrument_key, access_token)
+            # Step 2: Filter for monthly expiries
+            monthly_expiries = filter_monthly_expiries(all_expiries)
+            print(f"\nFound {len(monthly_expiries)} monthly expiries (out of {len(all_expiries)} total):", monthly_expiries)
 
-    if not expiry_data:
-        print("Failed to get expiry dates. Exiting.")
-        return
+            # Step 3 & 4: For each monthly expiry, get Nifty price and filter contracts
+            for expiry_date in monthly_expiries:
+                print(f"\n\nProcessing monthly expiry: {expiry_date}")
 
-    if not args.expiry_start_date or not args.expiry_end_date or not args.data_start_date:
-        print("Please provide --expiry_start_date, --expiry_end_date, and --data_start_date to fetch the data.")
-        print("Available expiry dates:")
-        for d in expiry_data:
-            print(d['expiry_date'])
-        return
+                # Get Nifty price at the start of the month
+                dt_expiry = datetime.strptime(expiry_date, "%Y-%m-%d")
+                nifty_price_at_start = get_price_at_month_start(access_token, NIFTY_UNDERLYING, dt_expiry.year, dt_expiry.month)
 
-    # Filter expiry dates
-    filtered_expiry_data = [d for d in expiry_data if args.expiry_start_date <= d['expiry_date'] <= args.expiry_end_date]
+                if nifty_price_at_start:
+                    lower_bound = nifty_price_at_start * 0.90
+                    upper_bound = nifty_price_at_start * 1.10
+                    print(f"Nifty price range (+/- 10%): {lower_bound:.2f} - {upper_bound:.2f}")
 
-    if not filtered_expiry_data:
-        print("No expiry dates found in the specified range.")
-        return
+                    # Fetch all contracts for this expiry
+                    all_contracts = get_expired_option_contracts(access_token, NIFTY_UNDERLYING, expiry_date)
 
-    # Fetch and save historical data
-    for expiry_info in filtered_expiry_data:
-        expiry_date = expiry_info['expiry_date']
-        expired_instrument_key = expiry_info['expired_instrument_key']
+                    # Filter contracts by strike price
+                    filtered_contracts = []
+                    for contract in all_contracts:
+                        try:
+                            strike_price = float(contract.get("strike_price"))
+                            if lower_bound <= strike_price <= upper_bound:
+                                filtered_contracts.append(contract)
+                        except (ValueError, TypeError):
+                            # Handle cases where strike_price is missing or not a number
+                            continue
 
-        print(f"Fetching data for expiry: {expiry_date}")
+                    print(f"Found {len(filtered_contracts)} contracts (out of {len(all_contracts)}) within the strike price range for expiry {expiry_date}.")
+                    print("First few filtered contracts:")
+                    for c in filtered_contracts[:5]:
+                        print(c)
+                else:
+                    print(f"Skipping expiry {expiry_date} as Nifty start-of-month price could not be determined.")
+        else:
+            print("No access_token found in response!")
 
-        ohlc_data = get_historical_data(expired_instrument_key, args.data_start_date, expiry_date, access_token)
+        print("\nReminder: Upstox tokens expire at 03:30 AM IST the following day.")
 
-        if ohlc_data:
-            df = pd.DataFrame(ohlc_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'open_interest'])
-            filename = f"nifty_ohlc_{expiry_date}.csv"
-            df.to_csv(filename, index=False)
-            print(f"Data saved to {filename}")
+    except Exception as e:
+        print("Error:", e, file=sys.stderr)
+    finally:
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
