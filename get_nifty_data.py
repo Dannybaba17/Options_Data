@@ -41,8 +41,7 @@ _received_auth_code = {"code": None, "error": None}
 # ---------- Auth flow helpers ----------
 class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        parsed = urlparse.urlparse(self.path)
-        qs = urlparse.parse_qs(parsed.query)
+        parsed = urlparse.urlparse(self.path); qs = urlparse.parse_qs(parsed.query)
         if "code" in qs: _received_auth_code["code"] = qs["code"][0]
         self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
         self.wfile.write(b"<html><body><h2>Login successful. You can close this window.</h2></body></html>")
@@ -82,7 +81,8 @@ def calculate_std_dev(prices: list, period: int = 20) -> float:
     if len(prices) < period: return 0.0
     return np.std(prices[-period:])
 
-def get_historical_candles(access_token, instrument_key, interval, to_date, from_date):
+def get_historical_candles(access_token, instrument_key, interval, from_date, to_date):
+    # CORRECTED URL FORMAT: to_date comes before from_date
     try:
         headers = {"Authorization": f"Bearer {access_token}"}
         url = f"{HISTORICAL_URL}/{urlparse.quote(instrument_key)}/{interval}/{to_date}/{from_date}"
@@ -90,15 +90,8 @@ def get_historical_candles(access_token, instrument_key, interval, to_date, from
         return resp.json().get("data", {}).get("candles", [])
     except requests.HTTPError as e:
         if e.response.status_code == 404: return []
-        else: print(f"HTTP Error fetching candles for {instrument_key}: {e}"); return []
+        else: print(f"HTTP Error fetching candles for {instrument_key} from {from_date} to {to_date}: {e}"); return []
     except Exception as e: print(f"Error fetching candles for {instrument_key}: {e}"); return []
-
-def get_price_at_time(access_token, instrument_key, date_str, target_time_str):
-    candles = get_historical_candles(access_token, instrument_key, "1minute", date_str, date_str)
-    for candle in reversed(candles):
-        if datetime.fromisoformat(candle[0]).strftime("%H:%M") <= target_time_str:
-            return candle[4]
-    return None
 
 def find_closest_strikes(chain, spot_price):
     target_call_strike, target_put_strike = spot_price * 1.05, spot_price * 0.95
@@ -144,29 +137,35 @@ def generate_monthly_expiries(start_date, end_date):
         if month > 12: month, year = 1, year + 1
     return sorted(expiries)
 
+def get_daily_close(access_token, instrument_key, date_obj):
+    from_date_str = to_date_str = date_obj.strftime("%Y-%m-%d")
+    candles = get_historical_candles(access_token, instrument_key, "day", from_date_str, to_date_str)
+    return candles[0][4] if candles else None
+
 def enter_strangle(access_token, trade_logger, entry_date, expiry_date_str, historical_prices):
     print(f"  Attempting to enter new strangle on {entry_date.strftime('%Y-%m-%d')} for {expiry_date_str} expiry...")
-    spot_price = get_price_at_time(access_token, NIFTY_UNDERLYING, entry_date.strftime('%Y-%m-%d'), "15:15")
-    if not spot_price: print("  > Could not get spot price at 3:15 PM."); return None, historical_prices
+    spot_price = get_daily_close(access_token, NIFTY_UNDERLYING, entry_date)
+    if not spot_price: print("  > Could not get spot EOD price."); return None
+
+    # CORRECTED: Calculate SD on prices BEFORE the current entry day to avoid lookahead bias
+    sd = calculate_std_dev(historical_prices)
 
     chain = get_option_chain(access_token, expiry_date_str)
-    if not chain: print("  > Could not fetch option chain."); return None, historical_prices
+    if not chain: print("  > Could not fetch option chain."); return None
     call_to_sell, put_to_sell = find_closest_strikes(chain, spot_price)
-    if not call_to_sell or not put_to_sell: print("  > Could not find suitable strikes."); return None, historical_prices
+    if not call_to_sell or not put_to_sell: print("  > Could not find suitable strikes."); return None
 
-    call_price = get_price_at_time(access_token, call_to_sell['instrument_key'], entry_date.strftime('%Y-%m-%d'), "15:15")
-    put_price = get_price_at_time(access_token, put_to_sell['instrument_key'], entry_date.strftime('%Y-%m-%d'), "15:15")
+    call_price = get_daily_close(access_token, call_to_sell['instrument_key'], entry_date)
+    put_price = get_daily_close(access_token, put_to_sell['instrument_key'], entry_date)
 
     if call_price and put_price:
-        historical_prices.append(spot_price)
-        sd = calculate_std_dev(historical_prices)
         position = {'call': call_to_sell, 'put': put_to_sell, 'entry_spot': spot_price, 'sd_upper': spot_price + (2*sd), 'sd_lower': spot_price - (2*sd)}
         trade_logger.log(entry_date, position['call']['instrument_key'], "SELL", call_price, "Entry")
         trade_logger.log(entry_date, position['put']['instrument_key'], "SELL", put_price, "Entry")
-        print(f"  > Entered strangle: SOLD {position['call']['instrument_key']} @ {call_price}, SOLD {position['put']['instrument_key']} @ {put_price}")
-        return position, historical_prices
-    print("  > Could not get option prices at 3:15 PM.")
-    return None, historical_prices
+        print(f"  > Entered strangle. SD band: {position['sd_lower']:.2f} - {position['sd_upper']:.2f}")
+        return position
+    print("  > Could not get option EOD prices.")
+    return None
 
 # ---------- Main Backtesting Engine ----------
 def main():
@@ -198,66 +197,71 @@ def main():
             exit_date = next_expiry_date - timedelta(days=1)
             print(f"\n--- Cycle: {entry_date} -> {exit_date} ---")
 
-            hist_candles = get_historical_candles(access_token, NIFTY_UNDERLYING, "day", entry_date.strftime('%Y-%m-%d'), (entry_date - timedelta(days=40)).strftime('%Y-%m-%d'))
-            historical_nifty_prices = [c[4] for c in hist_candles]
+            # CORRECTED: The order of dates for the API call is to_date, then from_date.
+            to_date_hist = entry_date.strftime('%Y-%m-%d')
+            from_date_hist = (entry_date - timedelta(days=40)).strftime('%Y-%m-%d')
+            hist_candles = get_historical_candles(access_token, NIFTY_UNDERLYING, "day", to_date_hist, from_date_hist)
+            historical_nifty_prices = [c[4] for c in hist_candles][-40:] # Trim to last 40 for efficiency
 
-            position, historical_nifty_prices = enter_strangle(access_token, trade_logger, entry_date, next_expiry_date.strftime('%Y-%m-%d'), historical_nifty_prices)
+            position = enter_strangle(access_token, trade_logger, entry_date, next_expiry_date.strftime('%Y-%m-%d'), historical_nifty_prices)
             if not position: print("  > Failed to enter position. Skipping cycle."); continue
 
             current_day = entry_date + timedelta(days=1)
             while current_day <= exit_date:
-                day_str = current_day.strftime("%Y-%m-%d")
-                daily_nifty_candles = get_historical_candles(access_token, NIFTY_UNDERLYING, "day", day_str, day_str)
-                if not daily_nifty_candles: current_day += timedelta(days=1); continue
+                if current_day.weekday() >= 5: # Skip weekends
+                    current_day += timedelta(days=1); continue
 
-                nifty_close = daily_nifty_candles[0][4]
+                nifty_close = get_daily_close(access_token, NIFTY_UNDERLYING, current_day)
+                if not nifty_close: current_day += timedelta(days=1); continue # Skip holidays
 
                 if not (position['sd_lower'] < nifty_close < position['sd_upper']):
-                    print(f"  ! STOP-LOSS on {day_str} at Nifty close {nifty_close}")
-                    call_close = get_price_at_time(access_token, position['call']['instrument_key'], day_str, "15:15") or 0
-                    put_close = get_price_at_time(access_token, position['put']['instrument_key'], day_str, "15:15") or 0
+                    print(f"  ! STOP-LOSS on {current_day} at Nifty close {nifty_close}")
+                    call_close = get_daily_close(access_token, position['call']['instrument_key'], current_day) or 0
+                    put_close = get_daily_close(access_token, position['put']['instrument_key'], current_day) or 0
                     trade_logger.log(current_day, position['call']['instrument_key'], "BUY", call_close, "Stop-Loss")
                     trade_logger.log(current_day, position['put']['instrument_key'], "BUY", put_close, "Stop-Loss")
 
                     historical_nifty_prices.append(nifty_close)
-                    position, historical_nifty_prices = enter_strangle(access_token, trade_logger, current_day, next_expiry_date.strftime('%Y-%m-%d'), historical_nifty_prices)
+                    historical_nifty_prices = historical_nifty_prices[-40:] # Trim list
+                    position = enter_strangle(access_token, trade_logger, current_day, next_expiry_date.strftime('%Y-%m-%d'), historical_nifty_prices)
                     if not position: print("  > Failed to re-enter position. Ending cycle."); break
                 else:
-                    call_candles = get_historical_candles(access_token, position['call']['instrument_key'], "day", day_str, day_str)
-                    put_candles = get_historical_candles(access_token, position['put']['instrument_key'], "day", day_str, day_str)
-                    if call_candles and put_candles:
-                        call_price, put_price = call_candles[0][4], put_candles[0][4]
+                    call_price = get_daily_close(access_token, position['call']['instrument_key'], current_day)
+                    put_price = get_daily_close(access_token, position['put']['instrument_key'], current_day)
+                    if call_price and put_price:
                         if call_price > 3 * put_price or put_price > 3 * call_price:
-                            print(f"  ! ADJUSTMENT on {day_str} (C:{call_price}, P:{put_price})")
+                            print(f"  ! ADJUSTMENT on {current_day} (C:{call_price}, P:{put_price})")
                             chain = get_option_chain(access_token, next_expiry_date.strftime('%Y-%m-%d'))
+                            if not chain: print("  > Could not get option chain for adjustment. Skipping adjustment."); continue
+
                             if call_price < put_price:
                                 trade_logger.log(current_day, position['call']['instrument_key'], "BUY", call_price, "Adjustment")
                                 new_call = find_option_by_premium(chain, put_price, 'CE')
                                 if new_call:
-                                    new_price = get_price_at_time(access_token, new_call['instrument_key'], day_str, "15:15") or new_call.get('last_price', 0)
+                                    new_price = get_daily_close(access_token, new_call['instrument_key'], current_day) or new_call.get('last_price', 0)
                                     trade_logger.log(current_day, new_call['instrument_key'], "SELL", new_price, "Adjustment")
                                     position['call'] = new_call
                             else:
                                 trade_logger.log(current_day, position['put']['instrument_key'], "BUY", put_price, "Adjustment")
                                 new_put = find_option_by_premium(chain, call_price, 'PE')
                                 if new_put:
-                                    new_price = get_price_at_time(access_token, new_put['instrument_key'], day_str, "15:15") or new_put.get('last_price', 0)
+                                    new_price = get_daily_close(access_token, new_put['instrument_key'], current_day) or new_put.get('last_price', 0)
                                     trade_logger.log(current_day, new_put['instrument_key'], "SELL", new_price, "Adjustment")
                                     position['put'] = new_put
                 current_day += timedelta(days=1)
 
             if position:
                 print(f"  > Exiting position on {exit_date}")
-                call_exit = get_price_at_time(access_token, position['call']['instrument_key'], exit_date.strftime('%Y-%m-%d'), "15:15") or 0
-                put_exit = get_price_at_time(access_token, position['put']['instrument_key'], exit_date.strftime('%Y-%m-%d'), "15:15") or 0
+                call_exit = get_daily_close(access_token, position['call']['instrument_key'], exit_date) or 0
+                put_exit = get_daily_close(access_token, position['put']['instrument_key'], exit_date) or 0
                 trade_logger.log(exit_date, position['call']['instrument_key'], "BUY", call_exit, "Cycle End")
                 trade_logger.log(exit_date, position['put']['instrument_key'], "BUY", put_exit, "Cycle End")
 
     except Exception as e:
         print(f"\nAn error occurred: {e}", file=sys.stderr)
     finally:
-        if server: server.shutdown()
-        if 'trade_logger' in locals(): trade_logger.close()
+        if 'server' in locals() and server: server.shutdown()
+        if 'trade_logger' in locals() and trade_logger: trade_logger.close()
         print("\nScript finished.")
 
 if __name__ == "__main__":
