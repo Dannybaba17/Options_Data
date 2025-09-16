@@ -1,16 +1,8 @@
 """
-upstox_oauth_login.py
+get_nifty_data.py
 
-Requirements:
-    pip install requests
-
-How it works:
-  1. Start a tiny HTTP server on localhost to receive the redirect with ?code=...
-  2. Open the Upstox authorization URL in the default browser.
-  3. After you log in and approve, Upstox redirects to your redirect_uri with code.
-  4. The script exchanges that code for an access_token.
-  5. It verifies the access_token by calling the /user/profile API.
-  6. It fetches expired expiries for Nifty and sample expired contracts.
+This script is a backtesting engine for a delta-neutral options trading strategy
+on the Nifty 50 index, using the Upstox API.
 """
 
 from datetime import datetime, date, timedelta
@@ -23,28 +15,26 @@ import requests
 import sys
 import time
 from collections import defaultdict
+import csv
+import os
+import numpy as np
+import calendar
 
 # ======= CONFIGURE THESE =======
-CLIENT_ID = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"   # client_id / API Key
-CLIENT_SECRET = "xxxxxxxxxxx"                         # client_secret
+CLIENT_ID = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+CLIENT_SECRET = "xxxxxxxxxxx"
 REDIRECT_HOST = "localhost"
 REDIRECT_PORT = 8080
-REDIRECT_URI = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}/"  # must match app settings
-
-# Nifty underlying instrument key (index)
+REDIRECT_URI = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}/"
 NIFTY_UNDERLYING = "NSE_INDEX|Nifty 50"
 # ===============================
 
-AUTH_URL = (
-    "https://api.upstox.com/v2/login/authorization/dialog"
-    "?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}"
-)
+# --- API URLs ---
+AUTH_URL = "https://api.upstox.com/v2/login/authorization/dialog?response_type=code&client_id={client_id}&redirect_uri={redirect_uri}"
 TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
 PROFILE_URL = "https://api.upstox.com/v2/user/profile"
 HISTORICAL_URL = "https://api.upstox.com/v2/historical-candle"
-
-EXPIRED_EXPIRIES_URL = "https://api.upstox.com/v2/expired-instruments/expiries"
-EXPIRED_OPTIONS_URL = "https://api.upstox.com/v2/expired-instruments/option/contract"
+OPTION_CHAIN_URL = "https://api.upstox.com/v2/option/chain"
 
 _received_auth_code = {"code": None, "error": None}
 
@@ -53,227 +43,222 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse.urlparse(self.path)
         qs = urlparse.parse_qs(parsed.query)
-        if "code" in qs:
-            code = qs["code"][0]
-            _received_auth_code["code"] = code
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<html><body><h2>Login successful. You can close this window.</h2></body></html>")
-        elif "error" in qs:
-            _received_auth_code["error"] = qs.get("error_description", ["Authorization error"])[0]
-            self.send_response(400)
-            self.end_headers()
-            self.wfile.write(b"<html><body><h2>Authorization failed or denied.</h2></body></html>")
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        return  # suppress logs
+        if "code" in qs: _received_auth_code["code"] = qs["code"][0]
+        self.send_response(200); self.send_header("Content-type", "text/html"); self.end_headers()
+        self.wfile.write(b"<html><body><h2>Login successful. You can close this window.</h2></body></html>")
+    def log_message(self, format, *args): return
 
 def start_local_server(host, port):
     server = socketserver.TCPServer((host, port), _Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    return server, thread
-
-def build_auth_url(client_id, redirect_uri):
-    return AUTH_URL.format(
-        client_id=urlparse.quote(client_id, safe=""),
-        redirect_uri=urlparse.quote(redirect_uri, safe="")
-    )
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 def exchange_code_for_token(code, client_id, client_secret, redirect_uri):
     headers = {"accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"}
-    data = {
-        "code": code,
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "redirect_uri": redirect_uri,
-        "grant_type": "authorization_code",
-    }
-    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=15)
-    resp.raise_for_status()
+    data = {"code": code, "client_id": client_id, "client_secret": client_secret, "redirect_uri": redirect_uri, "grant_type": "authorization_code"}
+    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=15); resp.raise_for_status()
     return resp.json()
 
 def verify_access_token(access_token):
     headers = {"Authorization": f"Bearer {access_token}"}
-    resp = requests.get(PROFILE_URL, headers=headers, timeout=15)
-    if resp.status_code == 200:
-        print("✅ Successfully authorized. Profile data:")
-        print(resp.json())
-        return True
-    else:
-        print("❌ Authorization failed:", resp.status_code, resp.text)
-        return False
+    resp = requests.get(PROFILE_URL, headers=headers, timeout=15); resp.raise_for_status()
+    print("✅ Successfully authorized.")
+    return True
 
-# ---------- New/Modified helpers ----------
-def filter_monthly_expiries(expiry_dates: list[str]) -> list[str]:
-    """From a list of YYYY-MM-DD strings, return only the latest date of each month."""
-    monthly_expiries_by_month = defaultdict(str)
-    for date_str in expiry_dates:
-        # Assuming date_str is 'YYYY-MM-DD'
-        year_month = date_str[:7]
-        if date_str > monthly_expiries_by_month[year_month]:
-            monthly_expiries_by_month[year_month] = date_str
-    return sorted(list(monthly_expiries_by_month.values()), reverse=True)
+# ---------- Strategy & Data Helpers ----------
+class TradeLogger:
+    def __init__(self, filename="trade_log.csv"):
+        self.filename = filename
+        is_new = not os.path.exists(filename)
+        self.file = open(self.filename, 'a', newline='')
+        self.writer = csv.writer(self.file)
+        if is_new: self.writer.writerow(["timestamp", "instrument_key", "action", "price", "reason"])
+    def log(self, timestamp, instrument, action, price, reason=""):
+        self.writer.writerow([timestamp, instrument, action, price, reason]); self.file.flush()
+    def close(self):
+        if self.file: self.file.close()
 
-def get_historical_price(access_token, instrument_key, date_str):
-    """Fetch historical candle data for a single day to get the opening price."""
-    headers = {"Authorization": f"Bearer {access_token}"}
-    instrument_key_encoded = urlparse.quote(instrument_key)
-    interval = "day"
-    url = f"{HISTORICAL_URL}/{instrument_key_encoded}/{interval}/{date_str}/{date_str}"
+def calculate_std_dev(prices: list, period: int = 20) -> float:
+    if len(prices) < period: return 0.0
+    return np.std(prices[-period:])
 
-    resp = requests.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    candles = data.get("data", {}).get("candles", [])
-    if candles:
-        # candle format: [timestamp, open, high, low, close, volume, OI]
-        return candles[0][1]  # return the opening price
-    return None
-
-def get_price_at_month_start(access_token, instrument_key, year, month):
-    """Get the opening price of the instrument on the first trading day of the month."""
-    # Try fetching for the first 5 days of the month to find the first trading day
-    for day in range(1, 6):
-        try:
-            date_str = f"{year}-{month:02d}-{day:02d}"
-            price = get_historical_price(access_token, instrument_key, date_str)
-            if price:
-                print(f"Found Nifty opening price for {date_str}: {price}")
-                return price
-        except requests.HTTPError as e:
-            if e.response.status_code == 404:
-                continue # It's a holiday/weekend, try next day
-            else:
-                print(f"HTTP error fetching price for {date_str}: {e}", file=sys.stderr)
-                return None # Or re-raise
-        except Exception as e:
-            print(f"Error fetching price for {date_str}: {e}", file=sys.stderr)
-            return None
-    print(f"Could not find Nifty price for start of {year}-{month:02d}", file=sys.stderr)
-    return None
-
-# ---------- Expired instruments helpers ----------
-def get_expiries(access_token, instrument_key):
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"instrument_key": instrument_key}
-    resp = requests.get(EXPIRED_EXPIRIES_URL, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    print("DEBUG /expired-instruments/expiries response:", data)
-    if isinstance(data, dict) and "data" in data:
-        return data["data"]  # directly the list
-    return []
-
-
-def get_expired_option_contracts(access_token, instrument_key, expiry_date):
-    headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"instrument_key": instrument_key, "expiry_date": expiry_date}
-    resp = requests.get(EXPIRED_OPTIONS_URL, headers=headers, params=params, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    print(f"DEBUG /expired-instruments/option/contract response for {expiry_date}:", data)
-    if isinstance(data, dict):
-        return data.get("data", {}).get("contracts", [])
-    elif isinstance(data, list):
-        return data
-    else:
-        return []
-
-
-# ---------- Main ----------
-def main():
-    if CLIENT_ID.startswith("X") or CLIENT_SECRET.startswith("x"):
-        print("Please edit the script and set CLIENT_ID and CLIENT_SECRET.", file=sys.stderr)
-        sys.exit(1)
-
-    print("Starting local server to receive redirect (Ctrl+C to quit)...")
-    server, thread = start_local_server(REDIRECT_HOST, REDIRECT_PORT)
-
+def get_historical_candles(access_token, instrument_key, interval, to_date, from_date):
     try:
-        auth_url = build_auth_url(CLIENT_ID, REDIRECT_URI)
-        print("Opening browser for Upstox login. If browser does not open, visit this URL manually:\n")
-        print(auth_url + "\n")
-        webbrowser.open(auth_url)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        url = f"{HISTORICAL_URL}/{urlparse.quote(instrument_key)}/{interval}/{to_date}/{from_date}"
+        resp = requests.get(url, headers=headers, timeout=15); resp.raise_for_status()
+        return resp.json().get("data", {}).get("candles", [])
+    except requests.HTTPError as e:
+        if e.response.status_code == 404: return []
+        else: print(f"HTTP Error fetching candles for {instrument_key}: {e}"); return []
+    except Exception as e: print(f"Error fetching candles for {instrument_key}: {e}"); return []
 
-        print("Waiting for authorization code... (complete login in the opened browser window)")
-        start = time.time()
-        TIMEOUT = 300  # seconds
-        while time.time() - start < TIMEOUT:
-            if _received_auth_code.get("code"):
-                code = _received_auth_code["code"]
-                print("Received authorization code:", code)
+def get_price_at_time(access_token, instrument_key, date_str, target_time_str):
+    candles = get_historical_candles(access_token, instrument_key, "1minute", date_str, date_str)
+    for candle in reversed(candles):
+        if datetime.fromisoformat(candle[0]).strftime("%H:%M") <= target_time_str:
+            return candle[4]
+    return None
+
+def find_closest_strikes(chain, spot_price):
+    target_call_strike, target_put_strike = spot_price * 1.05, spot_price * 0.95
+    closest_call, closest_put = None, None
+    min_call_diff, min_put_diff = float('inf'), float('inf')
+    for option in chain:
+        try:
+            strike, o_type = float(option.get('strike_price')), option.get('option_type')
+            diff = abs(strike - (target_call_strike if o_type == 'CE' else target_put_strike))
+            if o_type == 'CE' and diff < min_call_diff: min_call_diff, closest_call = diff, option
+            elif o_type == 'PE' and diff < min_put_diff: min_put_diff, closest_put = diff, option
+        except (ValueError, TypeError): continue
+    return closest_call, closest_put
+
+def find_option_by_premium(chain, target_premium, option_type_to_find):
+    closest_option, min_premium_diff = None, float('inf')
+    for option in chain:
+        if option.get('option_type') == option_type_to_find:
+            try:
+                ltp = float(option.get('last_price'))
+                diff = abs(ltp - target_premium)
+                if diff < min_premium_diff: min_premium_diff, closest_option = diff, option
+            except (ValueError, TypeError): continue
+    return closest_option
+
+def get_option_chain(access_token, expiry_date):
+    headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+    params = {"instrument_key": NIFTY_UNDERLYING, "expiry_date": expiry_date}
+    resp = requests.get(OPTION_CHAIN_URL, headers=headers, params=params, timeout=30); resp.raise_for_status()
+    return resp.json().get("data", [])
+
+def generate_monthly_expiries(start_date, end_date):
+    expiries = []
+    year, month = start_date.year, start_date.month
+    while date(year, month, 1) <= end_date:
+        _, last_day = calendar.monthrange(year, month)
+        for day in range(last_day, 0, -1):
+            expiry_candidate = date(year, month, day)
+            if expiry_candidate.weekday() == 3: # Thursday
+                if expiry_candidate >= start_date: expiries.append(expiry_candidate)
                 break
-            if _received_auth_code.get("error"):
-                raise RuntimeError("Authorization error: " + str(_received_auth_code["error"]))
+        month += 1
+        if month > 12: month, year = 1, year + 1
+    return sorted(expiries)
+
+def enter_strangle(access_token, trade_logger, entry_date, expiry_date_str, historical_prices):
+    print(f"  Attempting to enter new strangle on {entry_date.strftime('%Y-%m-%d')} for {expiry_date_str} expiry...")
+    spot_price = get_price_at_time(access_token, NIFTY_UNDERLYING, entry_date.strftime('%Y-%m-%d'), "15:15")
+    if not spot_price: print("  > Could not get spot price at 3:15 PM."); return None, historical_prices
+
+    chain = get_option_chain(access_token, expiry_date_str)
+    if not chain: print("  > Could not fetch option chain."); return None, historical_prices
+    call_to_sell, put_to_sell = find_closest_strikes(chain, spot_price)
+    if not call_to_sell or not put_to_sell: print("  > Could not find suitable strikes."); return None, historical_prices
+
+    call_price = get_price_at_time(access_token, call_to_sell['instrument_key'], entry_date.strftime('%Y-%m-%d'), "15:15")
+    put_price = get_price_at_time(access_token, put_to_sell['instrument_key'], entry_date.strftime('%Y-%m-%d'), "15:15")
+
+    if call_price and put_price:
+        historical_prices.append(spot_price)
+        sd = calculate_std_dev(historical_prices)
+        position = {'call': call_to_sell, 'put': put_to_sell, 'entry_spot': spot_price, 'sd_upper': spot_price + (2*sd), 'sd_lower': spot_price - (2*sd)}
+        trade_logger.log(entry_date, position['call']['instrument_key'], "SELL", call_price, "Entry")
+        trade_logger.log(entry_date, position['put']['instrument_key'], "SELL", put_price, "Entry")
+        print(f"  > Entered strangle: SOLD {position['call']['instrument_key']} @ {call_price}, SOLD {position['put']['instrument_key']} @ {put_price}")
+        return position, historical_prices
+    print("  > Could not get option prices at 3:15 PM.")
+    return None, historical_prices
+
+# ---------- Main Backtesting Engine ----------
+def main():
+    if CLIENT_ID.startswith("X"): sys.exit("Please edit the script and set CLIENT_ID and CLIENT_SECRET.")
+
+    server = start_local_server(REDIRECT_HOST, REDIRECT_PORT)
+    access_token = None
+    try:
+        webbrowser.open(f"{AUTH_URL.format(client_id=urlparse.quote(CLIENT_ID), redirect_uri=urlparse.quote(REDIRECT_URI))}")
+        start_time = time.time()
+        while time.time() - start_time < 300:
+            if _received_auth_code.get("code"):
+                token_resp = exchange_code_for_token(_received_auth_code["code"], CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
+                access_token = token_resp.get("access_token"); break
             time.sleep(0.5)
-        else:
-            raise TimeoutError("Didn't receive auth code within timeout. Check redirect_uri and browser login.")
 
-        print("Exchanging code for tokens...")
-        token_resp = exchange_code_for_token(code, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI)
-        print("Token response (JSON):\n", token_resp)
+        if not access_token or not verify_access_token(access_token): raise ConnectionError("Failed to get a valid access token.")
 
-        access_token = token_resp.get("access_token")
-        if access_token and verify_access_token(access_token):
-            # Step 1: Fetch all expired expiries for Nifty
-            print("\n📌 Fetching all expired expiries for Nifty...")
-            all_expiries = get_expiries(access_token, NIFTY_UNDERLYING)
+        trade_logger = TradeLogger()
+        end_date = date.today()
+        start_date = end_date - timedelta(days=5*365)
 
-            # Step 2: Filter for monthly expiries
-            monthly_expiries = filter_monthly_expiries(all_expiries)
-            print(f"\nFound {len(monthly_expiries)} monthly expiries (out of {len(all_expiries)} total):", monthly_expiries)
+        print(f"\n--- Initializing Backtest from {start_date} to {end_date} ---")
+        monthly_expiries = generate_monthly_expiries(start_date, end_date)
 
-            # Step 3 & 4: For each monthly expiry, get Nifty price and filter contracts
-            for expiry_date in monthly_expiries:
-                print(f"\n\nProcessing monthly expiry: {expiry_date}")
+        for i in range(len(monthly_expiries) - 1):
+            entry_date = monthly_expiries[i]
+            next_expiry_date = monthly_expiries[i+1]
+            exit_date = next_expiry_date - timedelta(days=1)
+            print(f"\n--- Cycle: {entry_date} -> {exit_date} ---")
 
-                # Get Nifty price at the start of the month
-                dt_expiry = datetime.strptime(expiry_date, "%Y-%m-%d")
-                nifty_price_at_start = get_price_at_month_start(access_token, NIFTY_UNDERLYING, dt_expiry.year, dt_expiry.month)
+            hist_candles = get_historical_candles(access_token, NIFTY_UNDERLYING, "day", entry_date.strftime('%Y-%m-%d'), (entry_date - timedelta(days=40)).strftime('%Y-%m-%d'))
+            historical_nifty_prices = [c[4] for c in hist_candles]
 
-                if nifty_price_at_start:
-                    lower_bound = nifty_price_at_start * 0.90
-                    upper_bound = nifty_price_at_start * 1.10
-                    print(f"Nifty price range (+/- 10%): {lower_bound:.2f} - {upper_bound:.2f}")
+            position, historical_nifty_prices = enter_strangle(access_token, trade_logger, entry_date, next_expiry_date.strftime('%Y-%m-%d'), historical_nifty_prices)
+            if not position: print("  > Failed to enter position. Skipping cycle."); continue
 
-                    # Fetch all contracts for this expiry
-                    all_contracts = get_expired_option_contracts(access_token, NIFTY_UNDERLYING, expiry_date)
+            current_day = entry_date + timedelta(days=1)
+            while current_day <= exit_date:
+                day_str = current_day.strftime("%Y-%m-%d")
+                daily_nifty_candles = get_historical_candles(access_token, NIFTY_UNDERLYING, "day", day_str, day_str)
+                if not daily_nifty_candles: current_day += timedelta(days=1); continue
 
-                    # Filter contracts by strike price
-                    filtered_contracts = []
-                    for contract in all_contracts:
-                        try:
-                            strike_price = float(contract.get("strike_price"))
-                            if lower_bound <= strike_price <= upper_bound:
-                                filtered_contracts.append(contract)
-                        except (ValueError, TypeError):
-                            # Handle cases where strike_price is missing or not a number
-                            continue
+                nifty_close = daily_nifty_candles[0][4]
 
-                    print(f"Found {len(filtered_contracts)} contracts (out of {len(all_contracts)}) within the strike price range for expiry {expiry_date}.")
-                    print("First few filtered contracts:")
-                    for c in filtered_contracts[:5]:
-                        print(c)
+                if not (position['sd_lower'] < nifty_close < position['sd_upper']):
+                    print(f"  ! STOP-LOSS on {day_str} at Nifty close {nifty_close}")
+                    call_close = get_price_at_time(access_token, position['call']['instrument_key'], day_str, "15:15") or 0
+                    put_close = get_price_at_time(access_token, position['put']['instrument_key'], day_str, "15:15") or 0
+                    trade_logger.log(current_day, position['call']['instrument_key'], "BUY", call_close, "Stop-Loss")
+                    trade_logger.log(current_day, position['put']['instrument_key'], "BUY", put_close, "Stop-Loss")
+
+                    historical_nifty_prices.append(nifty_close)
+                    position, historical_nifty_prices = enter_strangle(access_token, trade_logger, current_day, next_expiry_date.strftime('%Y-%m-%d'), historical_nifty_prices)
+                    if not position: print("  > Failed to re-enter position. Ending cycle."); break
                 else:
-                    print(f"Skipping expiry {expiry_date} as Nifty start-of-month price could not be determined.")
-        else:
-            print("No access_token found in response!")
+                    call_candles = get_historical_candles(access_token, position['call']['instrument_key'], "day", day_str, day_str)
+                    put_candles = get_historical_candles(access_token, position['put']['instrument_key'], "day", day_str, day_str)
+                    if call_candles and put_candles:
+                        call_price, put_price = call_candles[0][4], put_candles[0][4]
+                        if call_price > 3 * put_price or put_price > 3 * call_price:
+                            print(f"  ! ADJUSTMENT on {day_str} (C:{call_price}, P:{put_price})")
+                            chain = get_option_chain(access_token, next_expiry_date.strftime('%Y-%m-%d'))
+                            if call_price < put_price:
+                                trade_logger.log(current_day, position['call']['instrument_key'], "BUY", call_price, "Adjustment")
+                                new_call = find_option_by_premium(chain, put_price, 'CE')
+                                if new_call:
+                                    new_price = get_price_at_time(access_token, new_call['instrument_key'], day_str, "15:15") or new_call.get('last_price', 0)
+                                    trade_logger.log(current_day, new_call['instrument_key'], "SELL", new_price, "Adjustment")
+                                    position['call'] = new_call
+                            else:
+                                trade_logger.log(current_day, position['put']['instrument_key'], "BUY", put_price, "Adjustment")
+                                new_put = find_option_by_premium(chain, call_price, 'PE')
+                                if new_put:
+                                    new_price = get_price_at_time(access_token, new_put['instrument_key'], day_str, "15:15") or new_put.get('last_price', 0)
+                                    trade_logger.log(current_day, new_put['instrument_key'], "SELL", new_price, "Adjustment")
+                                    position['put'] = new_put
+                current_day += timedelta(days=1)
 
-        print("\nReminder: Upstox tokens expire at 03:30 AM IST the following day.")
+            if position:
+                print(f"  > Exiting position on {exit_date}")
+                call_exit = get_price_at_time(access_token, position['call']['instrument_key'], exit_date.strftime('%Y-%m-%d'), "15:15") or 0
+                put_exit = get_price_at_time(access_token, position['put']['instrument_key'], exit_date.strftime('%Y-%m-%d'), "15:15") or 0
+                trade_logger.log(exit_date, position['call']['instrument_key'], "BUY", call_exit, "Cycle End")
+                trade_logger.log(exit_date, position['put']['instrument_key'], "BUY", put_exit, "Cycle End")
 
     except Exception as e:
-        print("Error:", e, file=sys.stderr)
+        print(f"\nAn error occurred: {e}", file=sys.stderr)
     finally:
-        try:
-            server.shutdown()
-            server.server_close()
-        except Exception:
-            pass
+        if server: server.shutdown()
+        if 'trade_logger' in locals(): trade_logger.close()
+        print("\nScript finished.")
 
 if __name__ == "__main__":
     main()
